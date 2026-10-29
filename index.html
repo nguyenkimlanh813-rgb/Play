@@ -1,0 +1,283 @@
+using UnityEngine;
+using UnityEngine.UI;
+using System.Collections.Generic;
+
+// ==========================================
+// 1. HỆ THỐNG ĐIỀU KHIỂN XE MÁY (CONTROLLER)
+// ==========================================
+public class WePlayShipperGame : MonoBehaviour
+{
+    [Header("--- CÀI ĐẶT DI CHUYỂN XE MÁY ---")]
+    public float moveSpeed = 15f;       
+    public float turnSpeed = 45f;       
+    public float brakeForce = 30f;      
+    public Rigidbody motorbikeRigidbody;
+    
+    private float currentSpeed = 0f;
+    private bool isBraking = false;
+    private float turnInput = 0f;
+
+    [Header("--- TỰ ĐỘNG SINH KHUNG CẢNH ---")]
+    public List<GameObject> streetPrefabs;    
+    public float blockLength = 50f;           
+    public int maxBlocksOnScreen = 5;         
+    private List<GameObject> activeBlocks = new List<GameObject>();
+    private float spawnZ = 0f;                
+
+    [Header("--- NHIỆM VỤ GIAO HÀNG ---")]
+    public Text missionStatusText;     
+    public Text scoreText;             
+    public Text timerText;             
+    public Text cashText;              
+    public GameObject pickupPointPrefab;  
+    public GameObject deliveryPointPrefab;
+    public Transform deliveryArrow;       
+    public float timePerDelivery = 30f;   
+    public int cashRewardPerOrder = 50;   
+
+    private bool hasPackage = false;       
+    private int completedDeliveries = 0;   
+    private int sessionCash = 0;
+    private float timeRemaining;
+    private bool isGameActive = true;
+    private GameObject currentActivePoint; 
+
+    [Header("--- HỆ THỐNG XE GIAO THÔNG (AI) ---")]
+    public List<GameObject> trafficPrefabs; 
+    public float spawnDistance = 100f;      
+    public float spawnRate = 3f;            
+    public float minVehicleSpeed = 5f;      
+    public float maxVehicleSpeed = 12f;     
+    private float trafficTimer;
+    private float[] lanes = new float[] { -3.5f, 0f, 3.5f }; 
+
+    [Header("--- HỆ THỐNG CỬA HÀNG (SHOP) ---")]
+    public MotorbikeItem[] shopBikes;
+    public Text shopTotalCashText;        
+    public Button shopActionButton;       
+    public Text shopActionButtonText;
+    public GameObject shopPanel; // Kéo thả UI Panel của Shop vào đây (nếu có)
+    
+    private int currentSelectedBikeIndex = 0;
+
+    [System.Serializable]
+    public class MotorbikeItem
+    {
+        public string bikeName;       
+        public int price;             
+        public float speedBonus;      
+        public bool isUnlocked;       
+        public GameObject bikeVisualPrefab; 
+    }
+
+    void Start()
+    {
+        // Khởi tạo Vật lý xe máy
+        if (motorbikeRigidbody == null) motorbikeRigidbody = GetComponent<Rigidbody>();
+        if (motorbikeRigidbody != null)
+        {
+            motorbikeRigidbody.constraints = RigidbodyConstraints.FreezeRotationX | RigidbodyConstraints.FreezeRotationZ;
+        }
+
+        // Khởi tạo Dữ liệu Shop & Chọn xe
+        int myGlobalCash = PlayerPrefs.GetInt("TotalCash", 200);
+        shopBikes[0].isUnlocked = true; // Xe đầu tiên luôn mở khóa
+        for (int i = 1; i < shopBikes.Length; i++)
+        {
+            shopBikes[i].isUnlocked = PlayerPrefs.GetInt("BikeUnlocked_" + i, 0) == 1;
+        }
+        currentSelectedBikeIndex = PlayerPrefs.GetInt("SelectedBike", 0);
+        
+        // Kích hoạt mô hình xe máy được chọn
+        ApplySelectedBikeVisual();
+
+        // Khởi tạo Khung cảnh đường phố
+        for (int i = 0; i < maxBlocksOnScreen; i++)
+        {
+            SpawnStreetBlock(i == 0 ? 0 : Random.Range(0, streetPrefabs.Count));
+        }
+
+        // Khởi tạo Nhiệm vụ
+        timeRemaining = timePerDelivery;
+        UpdateGameplayUI();
+        SpawnNextDeliveryPoint(true); 
+        UpdateShopUI();
+    }
+
+    void Update()
+    {
+        if (!isGameActive) return;
+
+        // --- Xử lý Lệnh lái xe ---
+        if (!isBraking)
+        {
+            // Cộng thêm chỉ số tốc độ từ xe đang chọn trong Shop
+            float finalSpeed = moveSpeed + shopBikes[PlayerPrefs.GetInt("SelectedBike", 0)].speedBonus;
+            currentSpeed = Mathf.MoveTowards(currentSpeed, finalSpeed, Time.deltaTime * 10f);
+        }
+        else
+        {
+            currentSpeed = Mathf.MoveTowards(currentSpeed, 0f, Time.deltaTime * brakeForce);
+        }
+        turnInput = Input.GetAxis("Horizontal");
+
+        // --- Xử lý Sinh đường vô tận ---
+        if (transform.position.z - 60f > (spawnZ - maxBlocksOnScreen * blockLength))
+        {
+            SpawnStreetBlock(Random.Range(0, streetPrefabs.Count));
+            DeleteOldStreetBlock();
+        }
+
+        // --- Xử lý Đếm ngược Nhiệm vụ ---
+        if (timeRemaining > 0)
+        {
+            timeRemaining -= Time.deltaTime;
+            UpdateTimerUI();
+        }
+        else
+        {
+            GameOver();
+        }
+
+        // --- Xử lý Định vị Mũi tên ---
+        if (currentActivePoint != null && deliveryArrow != null)
+        {
+            deliveryArrow.position = transform.position + new Vector3(0f, 2.5f, 1f);
+            Vector3 direction = currentActivePoint.transform.position - deliveryArrow.position;
+            direction.y = 0; 
+            if (direction != Vector3.zero) deliveryArrow.rotation = Quaternion.LookRotation(direction);
+        }
+
+        // --- Xử lý Sinh xe cộ giao thông ---
+        trafficTimer += Time.deltaTime;
+        if (trafficTimer >= spawnRate)
+        {
+            SpawnTrafficVehicle();
+            trafficTimer = 0f;
+        }
+    }
+
+    void FixedUpdate()
+    {
+        if (!isGameActive) return;
+
+        // Vật lý di chuyển xe máy tiến lên
+        Vector3 forwardMovement = transform.forward * currentSpeed * Time.fixedDeltaTime;
+        motorbikeRigidbody.MovePosition(motorbikeRigidbody.position + forwardMovement);
+
+        // Vật lý xoay hướng trái/phải
+        float turnAmount = turnInput * turnSpeed * Time.fixedDeltaTime;
+        Quaternion turnRotation = Quaternion.Euler(0f, turnAmount, 0f);
+        motorbikeRigidbody.MoveRotation(motorbikeRigidbody.rotation * turnRotation);
+    }
+
+    // ==========================================
+    // CÁC HÀM XỬ LÝ LOGIC NỘI BỘ
+    // ==========================================
+    
+    // Sinh đường
+    void SpawnStreetBlock(int prefabIndex)
+    {
+        if (streetPrefabs.Count == 0) return;
+        GameObject block = Instantiate(streetPrefabs[prefabIndex], Vector3.forward * spawnZ, Quaternion.identity);
+        activeBlocks.Add(block);
+        spawnZ += blockLength;
+    }
+
+    void DeleteOldStreetBlock()
+    {
+        Destroy(activeBlocks[0]);
+        activeBlocks.RemoveAt(0);
+    }
+
+    // Sinh xe giao thông
+    void SpawnTrafficVehicle()
+    {
+        if (trafficPrefabs.Count == 0) return;
+        GameObject randomVehicle = trafficPrefabs[Random.Range(0, trafficPrefabs.Count)];
+        float randomLane = lanes[Random.Range(0, lanes.Length)];
+        Vector3 spawnPos = new Vector3(randomLane, 0.5f, transform.position.z + spawnDistance);
+        
+        GameObject vehicle = Instantiate(randomVehicle, spawnPos, Quaternion.Euler(0, 180, 0));
+        GlobalTrafficAI aiScript = vehicle.AddComponent<GlobalTrafficAI>();
+        aiScript.speed = Random.Range(minVehicleSpeed, maxVehicleSpeed);
+        aiScript.playerTransform = this.transform;
+    }
+
+    // Quản lý điểm Giao/Nhận
+    public void SpawnNextDeliveryPoint(bool isPickup)
+    {
+        if (currentActivePoint != null) Destroy(currentActivePoint);
+
+        float pointSpawnZ = transform.position.z + Random.Range(60f, 120f);
+        Vector3 spawnPosition = new Vector3(Random.Range(-4f, 4f), 0.5f, pointSpawnZ); 
+
+        GameObject prefabToSpawn = isPickup ? pickupPointPrefab : deliveryPointPrefab;
+        currentActivePoint = Instantiate(prefabToSpawn, spawnPosition, Quaternion.identity);
+        
+        GlobalDeliveryTrigger triggerScript = currentActivePoint.AddComponent<GlobalDeliveryTrigger>();
+        triggerScript.gameManager = this;
+        triggerScript.isPickupZone = isPickup;
+
+        if (deliveryArrow != null) deliveryArrow.gameObject.SetActive(true);
+    }
+
+    public void OnPlayerHitZone(bool isPickupZone)
+    {
+        if (!isGameActive) return;
+
+        if (isPickupZone && !hasPackage)
+        {
+            hasPackage = true;
+            timeRemaining = timePerDelivery; 
+            SpawnNextDeliveryPoint(false); 
+        }
+        else if (!isPickupZone && hasPackage)
+        {
+            hasPackage = false;
+            completedDeliveries++;
+            sessionCash += cashRewardPerOrder;
+            
+            // Lưu trực tiếp vào tổng tài khoản máy
+            int currentTotal = PlayerPrefs.GetInt("TotalCash", 0);
+            PlayerPrefs.SetInt("TotalCash", currentTotal + cashRewardPerOrder);
+            PlayerPrefs.Save();
+            
+            timeRemaining = timePerDelivery; 
+            SpawnNextDeliveryPoint(true);  
+        }
+        UpdateGameplayUI();
+        UpdateShopUI();
+    }
+
+    // Cập nhật giao diện
+    void UpdateGameplayUI()
+    {
+        if (scoreText != null) scoreText.text = "Đơn hàng: " + completedDeliveries;
+        if (cashText != null) cashText.text = "Tiền: $" + sessionCash;
+        if (missionStatusText != null)
+        {
+            missionStatusText.text = !hasPackage ? "📍 Hãy đến ĐIỂM XANH nhận hàng!" : "🏁 Hãy đến ĐIỂM ĐỎ giao hàng!";
+        }
+    }
+
+    void UpdateTimerUI()
+    {
+        if (timerText != null)
+        {
+            timerText.text = "Thời gian: " + Mathf.CeilToInt(timeRemaining) + "s";
+            timerText.color = (timeRemaining < 7f) ? Color.red : Color.white;
+        }
+    }
+
+    void GameOver()
+    {
+        isGameActive = false;
+        currentSpeed = 0f;
+        if (missionStatusText != null) missionStatusText.text = "💥 HẾT GIỜ! BẠN ĐÃ BỊ BOM HÀNG.";
+        if (deliveryArrow != null) deliveryArrow.gameObject.SetActive(false);
+        if (currentActivePoint != null) Destroy(currentActivePoint);
+    }
+
+    // Xử lý nút bấm Phanh trên giao diện (UI)
+    public void PointerDownBrake() { isBraking = true; }
